@@ -62,6 +62,50 @@ def _falling_factorial(d: int, k: int) -> float:
     return r
 
 
+def _derivative_cost_matrix(degree: int, k: int) -> np.ndarray:
+    """``M`` with ``int_0^1 ||r^(k)(s)||^2 ds = sum_c p_c^T M p_c`` for a degree-``degree``
+    Bezier curve ``r`` on ``s in [0, 1]``, where ``p_c`` holds coordinate ``c`` of its
+    control points.
+
+    The k-th derivative has control points ``D = ff(d, k) * Delta^k P`` (see
+    :func:`_fd_coeffs`) of degree ``m = d - k``, and the Bernstein Gram matrix is
+    ``G_ij = int_0^1 B_i^m B_j^m = C(m,i) C(m,j) / ((2m+1) C(2m, i+j))``, so
+    ``M = L^T G L`` with ``L`` the map from ``P`` to ``D``.
+    """
+    m = degree - k
+    fd = _fd_coeffs(k)
+    ff = _falling_factorial(degree, k)
+    L = np.zeros((m + 1, degree + 1))
+    for i in range(m + 1):
+        L[i, i : i + k + 1] = ff * fd
+    G = np.array(
+        [
+            [
+                _comb(m, i, exact=True)
+                * _comb(m, j, exact=True)
+                / ((2 * m + 1) * _comb(2 * m, i + j, exact=True))
+                for j in range(m + 1)
+            ]
+            for i in range(m + 1)
+        ]
+    )
+    return L.T @ G @ L
+
+
+def derivative_cost(
+    trajectory: pb.CompositeBezierCurve, segment_time: float, k: int
+) -> float:
+    """``int ||d^k r / dt^k||^2 dt`` of ``trajectory`` with every segment lasting
+    ``segment_time``. Each segment is a Bezier curve in ``s in [0, 1]`` with ``t = T s``,
+    so its cost is ``T^(1-2k) int_0^1 ||r^(k)(s)||^2 ds``."""
+    total = 0.0
+    for curve in trajectory.curves:
+        points = np.asarray(curve.points, float)
+        M = _derivative_cost_matrix(len(points) - 1, k)
+        total += segment_time ** (1 - 2 * k) * float(np.trace(points.T @ M @ points))
+    return total
+
+
 def _plane_constraint_matrix(
     a_points: np.ndarray,
     b_points: np.ndarray,
@@ -167,6 +211,18 @@ class TrajectoryUpdater:
     use_symbolic_constraints:
         Force the readable symbolic constraint path even for HPolyhedron sets.
         Default False (fast matrix path). Mainly for validation/testing.
+    fixed_segment_time:
+        If given, every segment lasts this duration ``T`` instead of ``T`` being a
+        decision variable, and the program minimizes ``cost_derivative_order``'s
+        derivative cost ``int ||d^k r / dt^k||^2 dt`` instead of time. The derivative
+        limits then hold at this ``T``. Since the cost no longer drives any derivative
+        to infinity, ``continuity_order`` and ``terminal_order`` may exceed ``J``.
+    cost_derivative_order:
+        The order ``k`` of the derivative cost under ``fixed_segment_time``.
+    allow_orders_above_limits:
+        Allow ``continuity_order`` and ``terminal_order`` above ``J`` also when
+        minimizing time, as the polygonal warm start of a ``fixed_segment_time``
+        problem needs.
     """
 
     def __init__(
@@ -181,6 +237,9 @@ class TrajectoryUpdater:
         terminal_order: Optional[int] = None,
         on_segment: bool = False,
         use_symbolic_constraints: bool = False,
+        fixed_segment_time: Optional[float] = None,
+        cost_derivative_order: int = 3,
+        allow_orders_above_limits: bool = False,
     ):
         self.source = np.asarray(source, float)
         self.target = np.asarray(target, float)
@@ -196,15 +255,25 @@ class TrajectoryUpdater:
 
         self.continuity_order = self.J if continuity_order is None else int(continuity_order)
         self.terminal_order = self.J if terminal_order is None else int(terminal_order)
+        if fixed_segment_time is not None and fixed_segment_time <= 0:
+            raise ValueError(f"fixed_segment_time must be positive, got {fixed_segment_time}.")
+        self.fixed_segment_time = fixed_segment_time
+        self.cost_derivative_order = int(cost_derivative_order)
+        orders_above_limits_ok = allow_orders_above_limits or fixed_segment_time is not None
+        if fixed_segment_time is not None and not 1 <= self.cost_derivative_order <= degree:
+            raise ValueError(
+                f"cost_derivative_order ({self.cost_derivative_order}) must be between 1 and "
+                f"degree={degree}."
+            )
 
-        if self.continuity_order > self.J:
+        if self.continuity_order > self.J and not orders_above_limits_ok:
             raise ValueError(
                 f"continuity_order ({self.continuity_order}) cannot exceed the highest "
                 f"constrained derivative order J={self.J}: the C{self.continuity_order} "
                 "constraint would couple an unconstrained derivative, which the minimum-time "
                 "objective drives to infinity."
             )
-        if not 0 <= self.terminal_order <= self.J:
+        if self.terminal_order < 0 or (self.terminal_order > self.J and not orders_above_limits_ok):
             raise ValueError(
                 f"terminal_order ({self.terminal_order}) must be between 0 and J={self.J}."
             )
@@ -230,6 +299,8 @@ class TrajectoryUpdater:
 
         self._build_time_variables()
         self._build_segments()
+        if self.fixed_segment_time is not None:
+            self._build_derivative_cost()
         self._build_boundary_constraints()
         if self.use_symbolic_constraints:
             self._build_limits_and_continuity_symbolic()
@@ -252,7 +323,25 @@ class TrajectoryUpdater:
             A[1, j] = 1
             A[2, j - 1] = 1
             self.prog.AddRotatedLorentzConeConstraint(A=A, b=np.zeros(3), vars=self.T_powers)
-        self.prog.AddLinearCost(self.T_powers[-1])  # minimize T**J (monotone in T)
+        if self.fixed_segment_time is None:
+            self.prog.AddLinearCost(self.T_powers[-1])  # minimize T**J (monotone in T)
+            return
+        # Fixed duration: pin every power, so each limit holds at the given T.
+        T = self.fixed_segment_time
+        self.prog.AddBoundingBoxConstraint(
+            np.array([T**j for j in range(self.J + 1)]),
+            np.array([T**j for j in range(self.J + 1)]),
+            self.T_powers,
+        )
+
+    def _build_derivative_cost(self) -> None:
+        """``sum over segments of T^(1-2k) int_0^1 ||r^(k)(s)||^2 ds`` as one quadratic
+        cost per segment, on its control points flattened row-major."""
+        k = self.cost_derivative_order
+        M = _derivative_cost_matrix(self.degree, k)
+        Q = 2 * self.fixed_segment_time ** (1 - 2 * k) * np.kron(M, np.eye(self.dim))
+        for vars_flat in self._seg_vars_flat:
+            self.prog.AddQuadraticCost(Q, np.zeros(len(vars_flat)), vars_flat, is_convex=True)
 
     def _build_segments(self) -> None:
         # Control points are decision variables, except shared junction points

@@ -35,6 +35,7 @@ from .limits import Limits
 from .polygonal import polygonal_initialization
 from .result import SolveResult
 from .updaters import PlaneUpdater, TrajectoryUpdater
+from .updaters.trajectory import derivative_cost
 
 
 def _merge_tagged(
@@ -80,6 +81,17 @@ class MinimumTimePlanner:
         Buffer keeping each supporting plane clear of the obstacle surface.
     collision_check_tol:
         Tolerance of the Bezier collision kernel (subdivision resolution).
+    fixed_duration:
+        If given, the trajectory lasts this total time, split evenly over its
+        segments, and each trajectory update minimizes the derivative cost
+        ``int ||d^k r / dt^k||^2 dt`` with ``k = cost_derivative_order`` instead of
+        time (see :class:`~pybmtp.updaters.TrajectoryUpdater`). The loop then stops
+        on the relative cost improvement between consecutive feasible iterates. The
+        warm start keeps its collision-free path, but if it needs longer than
+        ``fixed_duration`` it violates the limits at this duration, and it is
+        returned with ``converged = False`` if no update is feasible.
+    cost_derivative_order:
+        The order ``k`` of the derivative cost under ``fixed_duration``.
     """
 
     def __init__(
@@ -93,6 +105,8 @@ class MinimumTimePlanner:
         trajectory_to_plane_tol: float = 1e-8,
         plane_to_obstacle_tol: float = 1e-9,
         collision_check_tol: float = 0.05,
+        fixed_duration: float | None = None,
+        cost_derivative_order: int = 3,
     ):
         assert trajectory_degree >= 5, (
             "trajectory_degree must be >= 5 to satisfy zero boundary velocity "
@@ -107,6 +121,8 @@ class MinimumTimePlanner:
         self.trajectory_to_plane_tol = trajectory_to_plane_tol
         self.plane_to_obstacle_tol = plane_to_obstacle_tol
         self.collision_check_tol = collision_check_tol
+        self.fixed_duration = fixed_duration
+        self.cost_derivative_order = cost_derivative_order
 
     def solve(
         self,
@@ -134,9 +150,13 @@ class MinimumTimePlanner:
             continuity_order=self.continuity_order,
             terminal_order=self.terminal_order,
             force_same_segment_time=True,
+            allow_orders_above_limits=self.fixed_duration is not None,
         )
         num_segments = len(init.curves)
         segment_time_init = init.curves[0].duration
+        fixed_segment_time = (
+            None if self.fixed_duration is None else self.fixed_duration / num_segments
+        )
         # Re-time onto the normalized [seg/N, (seg+1)/N] grid the updater uses.
         r_feasible = _retime_normalized(init, num_segments)
 
@@ -149,6 +169,8 @@ class MinimumTimePlanner:
             degree=self.trajectory_degree,
             continuity_order=self.continuity_order,
             terminal_order=self.terminal_order,
+            fixed_segment_time=fixed_segment_time,
+            cost_derivative_order=self.cost_derivative_order,
         )
         plane_updater = PlaneUpdater(
             obstacles, self.plane_degree, plane_to_obstacle_tol=self.plane_to_obstacle_tol
@@ -158,9 +180,19 @@ class MinimumTimePlanner:
         all_planes: Dict[Tuple[int, int], Tuple[pb.BezierCurve, pb.BezierCurve]] = {}
         tagged: Dict[int, List[int]] = {}
         last_segment_time = segment_time_init
+        if fixed_segment_time is not None:
+            segment_time_init = fixed_segment_time
+        # The quantity whose relative improvement stops the loop: the segment time,
+        # or under fixed_duration, the derivative cost.
+        last_objective = (
+            segment_time_init
+            if fixed_segment_time is None
+            else derivative_cost(r_feasible, fixed_segment_time, self.cost_derivative_order)
+        )
 
         feasible_trajectories = [r_feasible]
         feasible_segment_times = [segment_time_init]
+        feasible_costs = [last_objective] if fixed_segment_time is not None else []
         feasible_wall_times = [0.0]
 
         timing = dict(
@@ -176,7 +208,7 @@ class MinimumTimePlanner:
             #    negated buffer so a positive trajectory_to_plane_tol pushes the
             #    trajectory away from the plane.
             t0 = time.time()
-            r_cand, segment_time, _, solver_time = traj_updater.solve(
+            r_cand, segment_time, cost, solver_time = traj_updater.solve(
                 new_planes, tol=-self.trajectory_to_plane_tol
             )
             timing["trajectory_update"] += time.time() - t0
@@ -196,8 +228,12 @@ class MinimumTimePlanner:
                 # Candidate is collision-free: accept it as the feasible iterate.
                 r_feasible = r_cand
                 traj_updater.clear_planes()
-                rel_improvement = (last_segment_time - segment_time) / last_segment_time
+                objective = segment_time if fixed_segment_time is None else cost
+                rel_improvement = (last_objective - objective) / last_objective
+                last_objective = objective
                 last_segment_time = segment_time
+                if fixed_segment_time is not None:
+                    feasible_costs.append(cost)
                 feasible_segment_times.append(segment_time)
                 feasible_trajectories.append(r_cand)
                 feasible_wall_times.append(time.time() - t_start)
@@ -240,6 +276,7 @@ class MinimumTimePlanner:
             planes=all_planes,
             feasible_trajectories=feasible_trajectories,
             feasible_segment_times=feasible_segment_times,
+            feasible_costs=feasible_costs,
             feasible_wall_times=feasible_wall_times,
             timing=timing,
         )

@@ -32,6 +32,7 @@ def polygonal_initialization(
     terminal_order: Optional[int] = None,
     on_segment: bool = True,
     force_same_segment_time: bool = False,
+    allow_orders_above_limits: bool = False,
 ) -> pb.CompositeBezierCurve:
     """Straight, rest-to-rest, minimum-time warm start through ``waypoints``.
 
@@ -47,6 +48,8 @@ def polygonal_initialization(
 
     ``degree``, ``continuity_order`` and ``terminal_order`` should match the final
     trajectory optimization so the seed satisfies the same constraints.
+    ``allow_orders_above_limits`` is passed to the updater, see
+    :class:`~pybmtp.updaters.TrajectoryUpdater`.
     """
     waypoints = np.asarray(waypoints, float)
     if waypoints.ndim != 2 or len(waypoints) < 2:
@@ -73,6 +76,7 @@ def polygonal_initialization(
                 continuity_order=continuity_order,
                 terminal_order=terminal_order,
                 on_segment=on_segment,  # keep the warm start on the (collision-free) segment
+                allow_orders_above_limits=allow_orders_above_limits,
             )
         else:
             updater.set_endpoints(start, end)

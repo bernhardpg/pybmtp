@@ -31,6 +31,9 @@ class SolveResult:
         The collision-free iterates found along the way (normalized-time curves),
         their per-segment times, and the wall-clock time (s) at which each was
         found. Useful for plotting convergence.
+    feasible_costs:
+        Under ``fixed_duration``, the derivative cost of each feasible iterate,
+        the warm start first. Empty when minimizing time.
     timing:
         Wall-clock breakdown of the solve (keys: ``total``, ``trajectory_update``,
         ``trajectory_solver``, ``collision_check``, ``plane_update``).
@@ -46,5 +49,6 @@ class SolveResult:
     )
     feasible_trajectories: List[pb.CompositeBezierCurve] = field(default_factory=list)
     feasible_segment_times: List[float] = field(default_factory=list)
+    feasible_costs: List[float] = field(default_factory=list)
     feasible_wall_times: List[float] = field(default_factory=list)
     timing: Dict[str, float] = field(default_factory=dict)
